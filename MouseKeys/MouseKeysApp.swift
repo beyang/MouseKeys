@@ -4,11 +4,121 @@ import CoreGraphics
 
 // MARK: - Data Model
 
+enum MappingScope: Codable, Equatable {
+    case global
+    case app(bundleIdentifier: String, displayName: String?)
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case bundleIdentifier
+        case displayName
+    }
+
+    private enum ScopeType: String, Codable {
+        case global
+        case app
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decodeIfPresent(ScopeType.self, forKey: .type) ?? .global
+
+        switch type {
+        case .global:
+            self = .global
+        case .app:
+            guard let bundleIdentifier = try container.decodeIfPresent(String.self, forKey: .bundleIdentifier), !bundleIdentifier.isEmpty else {
+                self = .global
+                return
+            }
+            let displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+            self = .app(bundleIdentifier: bundleIdentifier, displayName: displayName)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .global:
+            try container.encode(ScopeType.global, forKey: .type)
+        case .app(let bundleIdentifier, let displayName):
+            try container.encode(ScopeType.app, forKey: .type)
+            try container.encode(bundleIdentifier, forKey: .bundleIdentifier)
+            try container.encodeIfPresent(displayName, forKey: .displayName)
+        }
+    }
+
+    var identityKey: String {
+        switch self {
+        case .global:
+            return "global"
+        case .app(let bundleIdentifier, _):
+            return "app:\(bundleIdentifier.lowercased())"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .global:
+            return "All Applications"
+        case .app(let bundleIdentifier, let displayName):
+            return displayName ?? bundleIdentifier
+        }
+    }
+
+    var sortRank: Int {
+        switch self {
+        case .global: return 0
+        case .app: return 1
+        }
+    }
+
+    func matches(bundleIdentifier: String) -> Bool {
+        switch self {
+        case .global:
+            return true
+        case .app(let expectedBundleIdentifier, _):
+            return expectedBundleIdentifier.caseInsensitiveCompare(bundleIdentifier) == .orderedSame
+        }
+    }
+}
+
 struct ButtonMapping: Codable, Identifiable, Equatable {
-    var id: Int64 { mouseButton }
+    var id: String { "\(mouseButton)-\(scope.identityKey)" }
     let mouseButton: Int64
     var keyCode: CGKeyCode
     var modifiers: CGEventFlags
+    var scope: MappingScope
+
+    private enum CodingKeys: String, CodingKey {
+        case mouseButton
+        case keyCode
+        case modifiers
+        case scope
+    }
+
+    init(mouseButton: Int64, keyCode: CGKeyCode, modifiers: CGEventFlags, scope: MappingScope = .global) {
+        self.mouseButton = mouseButton
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+        self.scope = scope
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mouseButton = try container.decode(Int64.self, forKey: .mouseButton)
+        keyCode = try container.decode(CGKeyCode.self, forKey: .keyCode)
+        modifiers = try container.decode(CGEventFlags.self, forKey: .modifiers)
+        scope = try container.decodeIfPresent(MappingScope.self, forKey: .scope) ?? .global
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(mouseButton, forKey: .mouseButton)
+        try container.encode(keyCode, forKey: .keyCode)
+        try container.encode(modifiers, forKey: .modifiers)
+        try container.encode(scope, forKey: .scope)
+    }
 
     var mouseButtonLabel: String {
         switch mouseButton {
@@ -25,6 +135,10 @@ struct ButtonMapping: Codable, Identifiable, Equatable {
         if modifiers.contains(.maskControl) { parts.append("⌃") }
         parts.append(keyCodeName(keyCode))
         return parts.joined()
+    }
+
+    var scopeLabel: String {
+        scope.label
     }
 
     static var defaultMappings: [ButtonMapping] {
@@ -61,20 +175,31 @@ final class MappingStore: ObservableObject {
         load()
     }
 
-    func mapping(for button: Int64) -> ButtonMapping? {
-        mappings.first { $0.mouseButton == button }
+    func mapping(for button: Int64, frontmostBundleIdentifier: String?) -> ButtonMapping? {
+        if let frontmostBundleIdentifier,
+           let appScopedMapping = mappings.first(where: {
+               $0.mouseButton == button && $0.scope != .global && $0.scope.matches(bundleIdentifier: frontmostBundleIdentifier)
+           }) {
+            return appScopedMapping
+        }
+
+        return mappings.first { $0.mouseButton == button && $0.scope == .global }
     }
 
     func addOrUpdate(_ mapping: ButtonMapping) {
-        if let idx = mappings.firstIndex(where: { $0.mouseButton == mapping.mouseButton }) {
+        if let idx = mappings.firstIndex(where: {
+            $0.mouseButton == mapping.mouseButton && $0.scope.identityKey == mapping.scope.identityKey
+        }) {
             mappings[idx] = mapping
         } else {
             mappings.append(mapping)
         }
     }
 
-    func remove(mouseButton: Int64) {
-        mappings.removeAll { $0.mouseButton == mouseButton }
+    func remove(_ mapping: ButtonMapping) {
+        mappings.removeAll {
+            $0.mouseButton == mapping.mouseButton && $0.scope.identityKey == mapping.scope.identityKey
+        }
     }
 
     private func save() {
@@ -140,6 +265,45 @@ final class RecordingState: ObservableObject {
     }
 }
 
+final class FrontmostApplicationTracker: ObservableObject {
+    static let shared = FrontmostApplicationTracker()
+
+    @Published private(set) var displayBundleIdentifier = "Unknown"
+
+    private let stateQueue = DispatchQueue(label: "MouseKeys.FrontmostApplicationTracker")
+    private var currentBundleIdentifier: String?
+    private var activationObserver: NSObjectProtocol?
+
+    private init() {
+        currentBundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        displayBundleIdentifier = currentBundleIdentifier ?? "Unknown"
+
+        activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self?.setCurrentBundleIdentifier(app?.bundleIdentifier)
+        }
+    }
+
+    var bundleIdentifier: String? {
+        stateQueue.sync { currentBundleIdentifier }
+    }
+
+    private func setCurrentBundleIdentifier(_ bundleIdentifier: String?) {
+        stateQueue.async {
+            self.currentBundleIdentifier = bundleIdentifier
+        }
+
+        let displayValue = bundleIdentifier ?? "Unknown"
+        DispatchQueue.main.async {
+            self.displayBundleIdentifier = displayValue
+        }
+    }
+}
+
 // MARK: - Event Tap
 
 func eventTapCallback(
@@ -162,7 +326,8 @@ func eventTapCallback(
     }
 
     // Look up mapping
-    guard let mapping = MappingStore.shared.mapping(for: buttonNumber) else {
+    let frontmostBundleIdentifier = FrontmostApplicationTracker.shared.bundleIdentifier
+    guard let mapping = MappingStore.shared.mapping(for: buttonNumber, frontmostBundleIdentifier: frontmostBundleIdentifier) else {
         return Unmanaged.passRetained(event)
     }
 
@@ -183,20 +348,40 @@ func eventTapCallback(
 struct SettingsView: View {
     @ObservedObject var store = MappingStore.shared
     @ObservedObject var recording = RecordingState.shared
+    @ObservedObject var appTracker = FrontmostApplicationTracker.shared
     @State private var showingAddSheet = false
+
+    private var sortedMappings: [ButtonMapping] {
+        store.mappings.sorted { lhs, rhs in
+            if lhs.mouseButton != rhs.mouseButton {
+                return lhs.mouseButton < rhs.mouseButton
+            }
+            if lhs.scope.sortRank != rhs.scope.sortRank {
+                return lhs.scope.sortRank < rhs.scope.sortRank
+            }
+            return lhs.scopeLabel.localizedCaseInsensitiveCompare(rhs.scopeLabel) == .orderedAscending
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
-                Text("Mouse Button Mappings")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    showingAddSheet = true
-                } label: {
-                    Image(systemName: "plus")
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Mouse Button Mappings")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        showingAddSheet = true
+                    } label: {
+                        Image(systemName: "plus")
+                    }
                 }
+
+                Text("Current App: \(appTracker.displayBundleIdentifier)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
             .padding()
 
@@ -213,7 +398,7 @@ struct SettingsView: View {
                 .frame(maxHeight: .infinity)
             } else {
                 List {
-                    ForEach(store.mappings) { mapping in
+                    ForEach(sortedMappings) { mapping in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(mapping.mouseButtonLabel)
@@ -221,10 +406,13 @@ struct SettingsView: View {
                                 Text("→ \(mapping.shortcutLabel)")
                                     .font(.system(.caption, design: .monospaced))
                                     .foregroundStyle(.secondary)
+                                Text(mapping.scopeLabel)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
                             }
                             Spacer()
                             Button(role: .destructive) {
-                                store.remove(mouseButton: mapping.mouseButton)
+                                store.remove(mapping)
                             } label: {
                                 Image(systemName: "trash")
                                     .foregroundStyle(.red)
@@ -253,6 +441,9 @@ struct AddMappingView: View {
     @State private var useShift = false
     @State private var useOption = false
     @State private var useControl = false
+    @State private var selectedScopePreset: ScopePreset = .allApplications
+    @State private var customBundleIdentifier = ""
+    @State private var customAppName = ""
 
     var body: some View {
         VStack(spacing: 16) {
@@ -316,9 +507,29 @@ struct AddMappingView: View {
                 .padding(8)
             }
 
+            // Step 3: Scope
+            GroupBox("3. Scope") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Application", selection: $selectedScopePreset) {
+                        ForEach(ScopePreset.allCases) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    if selectedScopePreset == .custom {
+                        TextField("Bundle ID (e.g. com.apple.Safari)", text: $customBundleIdentifier)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("App Name (optional)", text: $customAppName)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                }
+                .padding(8)
+            }
+
             // Preview
             if let button = recording.lastRecordedButton {
-                Text("\(buttonLabel(button)) → \(previewShortcut)")
+                Text("\(buttonLabel(button)) [\(selectedScopeLabel)] → \(previewShortcut)")
                     .font(.system(.body, design: .monospaced))
                     .padding(8)
                     .background(Color.accentColor.opacity(0.1))
@@ -334,22 +545,22 @@ struct AddMappingView: View {
                 }
                 Spacer()
                 Button("Save") {
-                    guard let button = recording.lastRecordedButton else { return }
+                    guard let button = recording.lastRecordedButton, let scope = selectedScope else { return }
                     var flags = CGEventFlags()
                     if useCommand { flags.insert(.maskCommand) }
                     if useShift { flags.insert(.maskShift) }
                     if useOption { flags.insert(.maskAlternate) }
                     if useControl { flags.insert(.maskControl) }
-                    store.addOrUpdate(ButtonMapping(mouseButton: button, keyCode: selectedKeyCode, modifiers: flags))
+                    store.addOrUpdate(ButtonMapping(mouseButton: button, keyCode: selectedKeyCode, modifiers: flags, scope: scope))
                     recording.lastRecordedButton = nil
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(recording.lastRecordedButton == nil)
+                .disabled(recording.lastRecordedButton == nil || selectedScope == nil)
             }
         }
         .padding()
-        .frame(width: 320)
+        .frame(width: 360)
         .onDisappear {
             recording.isRecording = false
         }
@@ -369,6 +580,61 @@ struct AddMappingView: View {
         switch button {
         case 2: return "Middle Click (Button 3)"
         default: return "Button \(button + 1)"
+        }
+    }
+
+    private var selectedScope: MappingScope? {
+        switch selectedScopePreset {
+        case .allApplications, .safari, .googleChrome, .finder, .terminal:
+            return selectedScopePreset.scope
+        case .custom:
+            let bundleIdentifier = customBundleIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !bundleIdentifier.isEmpty else { return nil }
+            let appName = customAppName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .app(bundleIdentifier: bundleIdentifier, displayName: appName.isEmpty ? nil : appName)
+        }
+    }
+
+    private var selectedScopeLabel: String {
+        selectedScope?.label ?? "Custom"
+    }
+}
+
+enum ScopePreset: String, CaseIterable, Identifiable {
+    case allApplications
+    case safari
+    case googleChrome
+    case finder
+    case terminal
+    case custom
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .allApplications: return "All Applications"
+        case .safari: return "Safari"
+        case .googleChrome: return "Google Chrome"
+        case .finder: return "Finder"
+        case .terminal: return "Terminal"
+        case .custom: return "Custom App..."
+        }
+    }
+
+    var scope: MappingScope {
+        switch self {
+        case .allApplications:
+            return .global
+        case .safari:
+            return .app(bundleIdentifier: "com.apple.Safari", displayName: "Safari")
+        case .googleChrome:
+            return .app(bundleIdentifier: "com.google.Chrome", displayName: "Google Chrome")
+        case .finder:
+            return .app(bundleIdentifier: "com.apple.finder", displayName: "Finder")
+        case .terminal:
+            return .app(bundleIdentifier: "com.apple.Terminal", displayName: "Terminal")
+        case .custom:
+            return .global
         }
     }
 }
@@ -478,6 +744,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = FrontmostApplicationTracker.shared
+
         let trusted = AXIsProcessTrusted()
         print("[MouseKeys] Accessibility trusted: \(trusted)")
         if !trusted {
