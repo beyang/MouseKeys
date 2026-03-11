@@ -312,12 +312,13 @@ func eventTapCallback(
     event: CGEvent,
     userInfo: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
-    // Ignore tap-disabled notifications and non-otherMouseDown events
+    // Ignore non-otherMouseDown events
     guard type == .otherMouseDown else {
         return Unmanaged.passRetained(event)
     }
 
     let buttonNumber = event.getIntegerValueField(.mouseEventButtonNumber)
+    let frontmostBundleIdentifier = FrontmostApplicationTracker.shared.bundleIdentifier
     print("[MouseKeys] Event tap saw button: \(buttonNumber)")
 
     // If recording, let the event pass through so NSEvent monitors can see it
@@ -326,19 +327,23 @@ func eventTapCallback(
     }
 
     // Look up mapping
-    let frontmostBundleIdentifier = FrontmostApplicationTracker.shared.bundleIdentifier
     guard let mapping = MappingStore.shared.mapping(for: buttonNumber, frontmostBundleIdentifier: frontmostBundleIdentifier) else {
         return Unmanaged.passRetained(event)
     }
 
-    let source = CGEventSource(stateID: .hidSystemState)
-    if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: mapping.keyCode, keyDown: true),
-       let keyUp = CGEvent(keyboardEventSource: source, virtualKey: mapping.keyCode, keyDown: false) {
-        keyDown.flags = mapping.modifiers
-        keyUp.flags = mapping.modifiers
-        keyDown.post(tap: .cgSessionEventTap)
-        keyUp.post(tap: .cgSessionEventTap)
+    guard let source = CGEventSource(stateID: .hidSystemState) else {
+        return Unmanaged.passRetained(event)
     }
+
+    guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: mapping.keyCode, keyDown: true),
+          let keyUp = CGEvent(keyboardEventSource: source, virtualKey: mapping.keyCode, keyDown: false) else {
+        return Unmanaged.passRetained(event)
+    }
+
+    keyDown.flags = mapping.modifiers
+    keyUp.flags = mapping.modifiers
+    keyDown.post(tap: .cgSessionEventTap)
+    keyUp.post(tap: .cgSessionEventTap)
 
     return nil
 }
@@ -742,6 +747,8 @@ struct MouseKeysApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
+    private var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = FrontmostApplicationTracker.shared
@@ -757,6 +764,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             (1 << CGEventType.otherMouseDown.rawValue) |
             (1 << CGEventType.otherMouseUp.rawValue)
         )
+
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
@@ -769,7 +777,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        eventTap = tap
         let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        eventTapSource = runLoopSource
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         print("[MouseKeys] Event tap created and enabled successfully")
